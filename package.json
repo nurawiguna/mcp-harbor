@@ -11,6 +11,8 @@
     "README.md"
   ],
   "scripts": {
+    "dev": "node --loader ts-node/esm src/app.ts",
+    "start": "node dist/app.js",
     "test": "jest",
     "test:coverage": "jest --coverage",
     "build": "tsc && cp package.json dist/ && chmod +x dist/app.js",

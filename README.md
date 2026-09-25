@@ -24,6 +24,8 @@ MCP Harbor is a Node.js application that provides a Model Context Protocol (MCP)
     - [Command Line Arguments](#command-line-arguments)
     - [Environment Variables](#environment-variables)
     - [Securing the SSE Transport](#securing-the-sse-transport)
+    - [Running in Production](#running-in-production)
+    - [Using It From an MCP Client (e.g. Claude Desktop)](#using-it-from-an-mcp-client-eg-claude-desktop)
   - [MCP Tools](#mcp-tools)
   - [Development](#development)
     - [Running in Development Mode](#running-in-development-mode)
@@ -175,6 +177,58 @@ reachable by more than just your own machine:
 3. Prefer a trusted reverse proxy with TLS termination in front of the SSE port if it is exposed beyond
    `localhost`, since the SSE server itself speaks plain HTTP.
 
+### Running in Production
+
+Build once, then run the compiled output directly — no TypeScript tooling needed at runtime:
+
+```bash
+npm run build
+npm start -- --url https://harbor.example.com --username admin --password ***
+# or, with a .env file in place (see Environment Variables above):
+npm start
+```
+
+`npm start` just runs `node dist/app.js`; any flags after `--` are forwarded to it. You can also invoke
+`node dist/app.js` directly, or install it as a global command:
+
+```bash
+npm install -g .
+mcp-harbor --url https://harbor.example.com --username admin --password ***
+```
+
+For **SSE mode** in production, the process needs to keep running in the background (it doesn't daemonize
+itself). Use a process manager such as [pm2](https://pm2.keymetrics.io/) or a systemd unit, for example:
+
+```bash
+pm2 start dist/app.js --name mcp-harbor -- --sse --sse-host 127.0.0.1 --sse-auth-token "$HARBOR_SSE_AUTH_TOKEN"
+```
+
+See [Securing the SSE Transport](#securing-the-sse-transport) before exposing SSE mode beyond `localhost`.
+
+### Using It From an MCP Client (e.g. Claude Desktop)
+
+The most common way to run this in "production" is not from a terminal at all — the MCP client spawns it
+for you via **stdio** (see [Transport Modes](#transport-modes)). Point the client at the built binary and
+pass credentials as arguments or environment variables, e.g. in Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "harbor": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-harbor/dist/app.js"],
+      "env": {
+        "HARBOR_URL": "https://harbor.example.com",
+        "HARBOR_USERNAME": "admin",
+        "HARBOR_PASSWORD": "***"
+      }
+    }
+  }
+}
+```
+
+If installed globally (`npm install -g .`), you can use `"command": "mcp-harbor"` with `"args": []` instead.
+
 ## MCP Tools
 
 The MCP server exposes the following tools:
@@ -197,7 +251,11 @@ The MCP server exposes the following tools:
 
 ### Running in Development Mode
 
+Runs the TypeScript source directly (via `ts-node`'s ESM loader), no `npm run build` needed:
+
 ```bash
+npm run dev -- --url https://harbor.example.com --username admin --password ***
+# or, with a .env file in place:
 npm run dev
 ```
 
