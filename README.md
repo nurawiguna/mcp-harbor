@@ -3,7 +3,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-4.9.5-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-18.x-green.svg)](https://nodejs.org/)
-[![codecov](https://codecov.io/gh/nomagicln/mcp-harbor/graph/badge.svg?token=TZ95P20K6P)](https://codecov.io/gh/nomagicln/mcp-harbor)
+
+> **This is a fork** of [nomagicln/mcp-harbor](https://github.com/nomagicln/mcp-harbor), the original MCP server for Harbor.
+> It has been extended with additional configuration options and security hardening around the SSE transport
+> (see [What's Different From the Original](#whats-different-from-the-original)). All credit for the original
+> implementation goes to the upstream author; see [LICENSE](LICENSE) for the MIT license and copyright notice.
 
 MCP Harbor is a Node.js application that provides a Model Context Protocol (MCP) server for interacting with Harbor container registry.
 
@@ -11,12 +15,15 @@ MCP Harbor is a Node.js application that provides a Model Context Protocol (MCP)
 
 - [MCP Harbor](#mcp-harbor)
   - [Table of Contents](#table-of-contents)
+  - [What's Different From the Original](#whats-different-from-the-original)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
   - [Usage](#usage)
+    - [Transport Modes](#transport-modes)
     - [Command Line Arguments](#command-line-arguments)
     - [Environment Variables](#environment-variables)
+    - [Securing the SSE Transport](#securing-the-sse-transport)
   - [MCP Tools](#mcp-tools)
   - [Development](#development)
     - [Running in Development Mode](#running-in-development-mode)
@@ -27,6 +34,21 @@ MCP Harbor is a Node.js application that provides a Model Context Protocol (MCP)
     - [Debug Mode](#debug-mode)
     - [Support](#support)
   - [License](#license)
+
+## What's Different From the Original
+
+This fork keeps all the original Harbor MCP tools and behavior, and adds:
+
+- **TLS verification is secure by default**: the original disabled TLS certificate validation for the whole
+  process unconditionally. It is now opt-in via `--insecure-tls` / `HARBOR_INSECURE_TLS`, only relevant when
+  `HARBOR_URL` uses `https://` with a self-signed/internal certificate.
+- **Configurable SSE bind address**: the SSE server used to always bind `0.0.0.0` (all network interfaces).
+  It now defaults to `127.0.0.1` and is configurable via `--sse-host` / `HARBOR_SSE_HOST`.
+- **Bearer token authentication for SSE**: `/sse` and `/messages` can now require an
+  `Authorization: Bearer <token>` header via `--sse-auth-token` / `HARBOR_SSE_AUTH_TOKEN`, since the SSE
+  transport otherwise has no authentication of its own.
+- **Correct multi-client SSE sessions**: SSE connections are now tracked per session instead of a single
+  shared/global connection, so concurrent clients no longer risk having their messages cross-routed.
 
 ## Features
 
@@ -49,7 +71,7 @@ Before installing MCP Harbor, ensure you have:
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/nomagicln/mcp-harbor.git
+   git clone https://github.com/nurawiguna/mcp-harbor.git
    ```
 
 2. Navigate to the project directory:
@@ -72,32 +94,86 @@ Before installing MCP Harbor, ensure you have:
 
 ## Usage
 
+### Transport Modes
+
+MCP Harbor supports two transport modes:
+
+- **stdio** (default): the MCP client (e.g. Claude Desktop, Cursor) spawns `mcp-harbor` directly as a
+  subprocess and communicates over stdin/stdout. No network port is opened at all, so no SSE-related
+  configuration is needed. Use this when the client and `mcp-harbor` run on the same machine.
+- **SSE** (`--sse`): runs an HTTP server so MCP clients on a different machine/process can connect over the
+  network. Because this opens a network port, see [Securing the SSE Transport](#securing-the-sse-transport)
+  below before enabling it.
+
 ### Command Line Arguments
 
 The application accepts the following command line arguments:
 
 ```bash
 Options:
-  --url       Harbor API URL                     [string] [required]
-  --username  Harbor username                    [string] [required]
-  --password  Harbor password                    [string] [required]
-  --debug     Enable debug mode          [boolean] [default: false]
-  --help      Show help                                  [boolean]
+  --url            Harbor API URL (the remote Harbor server mcp-harbor
+                    connects to)                        [string] [required]
+  --username       Harbor username                      [string] [required]
+  --password       Harbor password                      [string] [required]
+  --insecure-tls   Disable TLS certificate verification when connecting to
+                    the Harbor URL over HTTPS. Only for trusted internal
+                    networks with a self-signed certificate.
+                                                 [boolean] [default: false]
+  --debug          Enable debug mode                [boolean] [default: false]
+  --sse            Enable SSE transport               [boolean] [default: false]
+  --port           Port for the local SSE server to listen on
+                                                      [number] [default: 3000]
+  --sse-host       Host/interface the local SSE server binds to (this
+                    machine, not the Harbor server)
+                                                 [string] [default: "127.0.0.1"]
+  --sse-auth-token Bearer token required to authenticate SSE connections to
+                    this MCP server                                 [string]
+  --help           Show help                                       [boolean]
 ```
 
 ### Environment Variables
 
-Instead of command line arguments, you can also use environment variables. Create a `.env` file in the root directory:
+Instead of command line arguments, you can also use environment variables. Create a `.env` file in the root directory (see [.env.example](.env.example)):
 
 ```env
 # Harbor API Configuration
+# HARBOR_URL is the remote Harbor server this app connects OUT to.
+# Works with either http:// or https:// (matches the Harbor server's own setup).
 HARBOR_URL=https://harbor.example.com
 HARBOR_USERNAME=admin
 HARBOR_PASSWORD=Harbor12345
 
+# Only set this to true if HARBOR_URL is https:// with a self-signed/internal
+# certificate. Leave it false (default) whenever the certificate is trusted,
+# or when HARBOR_URL is http:// (in which case it has no effect anyway).
+HARBOR_INSECURE_TLS=false
+
 # Debug Mode (true/false)
 DEBUG=false
+
+# --- Local SSE server (only used when --sse is enabled) ---
+# These configure mcp-harbor's OWN inbound server, i.e. where MCP clients
+# (Claude, Cursor, etc.) connect TO this app. Unrelated to HARBOR_URL above.
+
+# Host/interface this app listens on. Keep 127.0.0.1 unless this server sits
+# behind a trusted reverse proxy/firewall that restricts who can reach it.
+HARBOR_SSE_HOST=127.0.0.1
+# Bearer token required on the Authorization header for /sse and /messages.
+# Required in practice whenever HARBOR_SSE_HOST is anything other than 127.0.0.1.
+HARBOR_SSE_AUTH_TOKEN=change-me-to-a-long-random-value
 ```
+
+### Securing the SSE Transport
+
+The SSE transport has no authentication of its own, so treat these as required whenever `mcp-harbor` is
+reachable by more than just your own machine:
+
+1. Keep `HARBOR_SSE_HOST` at `127.0.0.1` unless a client genuinely needs to connect from another host.
+2. If it must be reachable from other hosts, set a long random `HARBOR_SSE_AUTH_TOKEN`
+   (e.g. `openssl rand -hex 32`) and put a firewall rule in front of the port restricting which hosts can
+   reach it.
+3. Prefer a trusted reverse proxy with TLS termination in front of the SSE port if it is exposed beyond
+   `localhost`, since the SSE server itself speaks plain HTTP.
 
 ## MCP Tools
 
