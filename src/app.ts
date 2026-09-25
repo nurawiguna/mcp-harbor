@@ -2,12 +2,15 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   McpError,
   ErrorCode,
   CallToolRequest,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { HarborService } from "./services/harbor.service.js";
 import { TOOL_DEFINITIONS } from "./definitions/tool.definitions.js";
@@ -15,7 +18,7 @@ import { config } from "dotenv";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import express from "express";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, randomUUID } from "node:crypto";
 
 // Load environment variables
 config();
@@ -162,9 +165,12 @@ const createServer: () => Promise<Server> = async (): Promise<Server> => {
 // Check if SSE transport is enabled
 if (argv.sse) {
   console.info("[MCP Server] Using SSE transport");
-  const app = express();
+  // createMcpExpressApp() also wires up express.json() body parsing and,
+  // for localhost hosts, DNS-rebinding protection (Host header validation).
+  const app = createMcpExpressApp({ host: argv.sseHost });
 
-  const transports = new Map<string, SSEServerTransport>();
+  const sseTransports = new Map<string, SSEServerTransport>();
+  const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
 
   const isAuthorized = (req: express.Request): boolean => {
     if (!argv.sseAuthToken) return true;
@@ -188,6 +194,8 @@ if (argv.sse) {
     next();
   };
 
+  // Deprecated HTTP+SSE transport (MCP protocol version 2024-11-05). Kept for
+  // clients that haven't moved to Streamable HTTP yet.
   app.get("/sse", requireAuth, async (req, res) => {
     console.log("[MCP Server] SSE connection established");
 
@@ -198,9 +206,9 @@ if (argv.sse) {
       // to a transport" on the second connection.
       const server = await createServer();
       const transport = new SSEServerTransport("/messages", res);
-      transports.set(transport.sessionId, transport);
+      sseTransports.set(transport.sessionId, transport);
       transport.onclose = (): void => {
-        transports.delete(transport.sessionId);
+        sseTransports.delete(transport.sessionId);
       };
 
       await server.connect(transport);
@@ -214,13 +222,74 @@ if (argv.sse) {
 
   app.post("/messages", requireAuth, (req, res) => {
     const sessionId = req.query.sessionId as string | undefined;
-    const transport = sessionId ? transports.get(sessionId) : undefined;
+    const transport = sessionId ? sseTransports.get(sessionId) : undefined;
 
     if (!transport) {
       res.status(400).send("No SSE connection established for this session");
       return;
     }
-    transport.handlePostMessage(req, res);
+    // req.body is already parsed by createMcpExpressApp()'s express.json(),
+    // so hand it to the transport instead of letting it re-read the stream.
+    transport.handlePostMessage(req, res, req.body);
+  });
+
+  // Streamable HTTP transport (current MCP spec) - handles GET/POST/DELETE
+  // on a single endpoint. Most current-generation MCP clients expect this.
+  app.all("/mcp", requireAuth, async (req, res) => {
+    try {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let transport = sessionId ? streamableTransports.get(sessionId) : undefined;
+
+      if (!transport) {
+        if (sessionId) {
+          res.status(404).json({
+            jsonrpc: "2.0",
+            error: { code: -32001, message: "Session not found" },
+            id: null,
+          });
+          return;
+        }
+
+        if (req.method !== "POST" || !isInitializeRequest(req.body)) {
+          res.status(400).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "Bad Request: No valid session ID provided",
+            },
+            id: null,
+          });
+          return;
+        }
+
+        const newTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: (): string => randomUUID(),
+          onsessioninitialized: (id: string): void => {
+            streamableTransports.set(id, newTransport);
+          },
+        });
+        newTransport.onclose = (): void => {
+          if (newTransport.sessionId) {
+            streamableTransports.delete(newTransport.sessionId);
+          }
+        };
+
+        const server = await createServer();
+        await server.connect(newTransport);
+        transport = newTransport;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("[MCP Server] Failed to handle /mcp request", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
+    }
   });
 
   app.listen(argv.port, argv.sseHost, () => {

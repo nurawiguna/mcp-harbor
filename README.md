@@ -52,6 +52,14 @@ This fork keeps all the original Harbor MCP tools and behavior, and adds:
   transport otherwise has no authentication of its own.
 - **Correct multi-client SSE sessions**: SSE connections are now tracked per session instead of a single
   shared/global connection, so concurrent clients no longer risk having their messages cross-routed.
+- **No more crash on a second SSE connection**: the original reused a single MCP `Server` instance across
+  every connection, which throws once a second client connects (the SDK only allows one transport per
+  `Server` instance) — and since it was unhandled, it took the whole process down. Every connection now gets
+  its own `Server` instance and errors are caught per-request instead of crashing the server.
+- **Streamable HTTP support (`/mcp`)**: the original only implemented the deprecated HTTP+SSE transport
+  (`/sse` + `/messages`). Most current MCP clients (2025-03-26+ spec) expect the newer Streamable HTTP
+  transport instead and get a `404` against `/sse`-only servers. This fork adds a `/mcp` endpoint
+  supporting both, following the SDK's own backwards-compatible server pattern.
 
 ## Features
 
@@ -104,11 +112,13 @@ MCP Harbor supports two transport modes:
 - **stdio** (default): the MCP client (e.g. Claude Desktop, Cursor) spawns `mcp-harbor` directly as a
   subprocess and communicates over stdin/stdout. No network port is opened at all, so no SSE-related
   configuration is needed. Use this when the client and `mcp-harbor` run on the same machine.
-- **SSE** (`--sse`, or `HARBOR_SSE=true` in `.env`): runs an HTTP server so MCP clients on a different
-  machine/process can connect over the network. This must be explicitly turned on — plain `npm start` /
-  `node dist/app.js` with no flags always runs stdio mode, even if `HARBOR_SSE_HOST`/`HARBOR_SSE_AUTH_TOKEN`
-  are set. Because enabling it opens a network port, see [Securing the SSE Transport](#securing-the-sse-transport)
-  below before enabling it.
+- **HTTP** (`--sse`, or `HARBOR_SSE=true` in `.env` — the flag name is `--sse` for historical reasons, but it
+  now enables both transports below): runs an HTTP server so MCP clients on a different machine/process can
+  connect over the network, exposing both `/mcp` (Streamable HTTP, current spec) and `/sse` (deprecated
+  HTTP+SSE) — see [Connecting to the SSE Endpoint](#connecting-to-the-sse-endpoint) for which one to use.
+  This must be explicitly turned on — plain `npm start` / `node dist/app.js` with no flags always runs stdio
+  mode, even if `HARBOR_SSE_HOST`/`HARBOR_SSE_AUTH_TOKEN` are set. Because enabling it opens a network port,
+  see [Securing the SSE Transport](#securing-the-sse-transport) below before enabling it.
 
 ### Command Line Arguments
 
@@ -189,33 +199,40 @@ reachable by more than just your own machine:
 
 ### Connecting to the SSE Endpoint
 
-When `--sse` is enabled, the URL an MCP client connects to is:
+When `--sse` is enabled, this server exposes **two** endpoints at the same time, for two different MCP
+protocol versions. Which one your MCP client actually uses depends on the client, not on you — most
+current-generation clients (2025+) speak Streamable HTTP; some older clients/SDKs only speak the deprecated
+SSE transport. Both work here; pick the URL that matches what your client expects:
 
-```
-http://<host>:<port>/sse
-```
+| Endpoint | Protocol | Methods | Use when |
+|---|---|---|---|
+| `http://<host>:<port>/mcp` | Streamable HTTP (current spec) | GET, POST, DELETE | Default choice — most clients today (2025-03-26+ spec) |
+| `http://<host>:<port>/sse` | HTTP+SSE (deprecated, 2024-11-05 spec) | GET (+ internal POST `/messages`) | Only if your client specifically requires the older SSE transport |
 
 - `<host>` / `<port>` are whatever `HARBOR_SSE_HOST` / `--port` are set to (default `127.0.0.1:3000`).
-- `/messages` is a **separate, internal** endpoint the server tells the client about after the `/sse`
-  connection is established (it includes a `sessionId` query parameter). MCP client libraries handle this
-  handshake automatically — you only ever configure the `/sse` URL, never `/messages` directly.
+- For `/sse`, `/messages` is a **separate, internal** endpoint the server tells the client about after the
+  connection is established (it includes a `sessionId` query parameter). You never configure `/messages`
+  directly — the client library handles that handshake automatically.
+- **If you point a client at `/sse` and it logs something like `SSE connection established` followed
+  immediately by a `404`/`Not Found` error**, that almost always means the client actually speaks Streamable
+  HTTP and tried to POST back to the same URL. Switch the client's URL to `/mcp` instead.
 
-Examples for `HARBOR_SSE_HOST=0.0.0.0`, default port:
+Examples for `HARBOR_SSE_HOST=0.0.0.0`, default port, using the recommended `/mcp` endpoint:
 
 | Where the client runs | URL to use |
 |---|---|
-| Same machine as `mcp-harbor` | `http://127.0.0.1:3000/sse` |
-| A different machine on the network | `http://<mcp-harbor-host-ip>:3000/sse` |
+| Same machine as `mcp-harbor` | `http://127.0.0.1:3000/mcp` |
+| A different machine on the network | `http://<mcp-harbor-host-ip>:3000/mcp` |
 
-If `HARBOR_SSE_AUTH_TOKEN` is set, the client must send it as a bearer token on every request to `/sse`
-(and `/messages`). For an MCP client config that supports a remote/URL-based server entry, this typically
+If `HARBOR_SSE_AUTH_TOKEN` is set, the client must send it as a bearer token on every request to whichever
+endpoint it uses. For an MCP client config that supports a remote/URL-based server entry, this typically
 looks like:
 
 ```json
 {
   "mcpServers": {
     "harbor": {
-      "url": "http://<mcp-harbor-host-ip>:3000/sse",
+      "url": "http://<mcp-harbor-host-ip>:3000/mcp",
       "headers": {
         "Authorization": "Bearer <your HARBOR_SSE_AUTH_TOKEN>"
       }
@@ -225,7 +242,7 @@ looks like:
 ```
 
 The exact field names (`url`, `headers`, etc.) vary by MCP client — check that client's docs for how it
-configures a remote/SSE MCP server.
+configures a remote MCP server, and whether it lets you pick the transport/protocol explicitly.
 
 ### Running in Production
 
@@ -403,6 +420,20 @@ mcp-harbor
 
     - Pipe in a real JSON-RPC message: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | npm start`
     - Or use `--sse` mode and test with `curl`/a browser against the [SSE endpoint](#connecting-to-the-sse-endpoint), which is easier to interact with manually.
+
+5. **`npm start` alone doesn't open any port at all**
+
+    `npm start` just runs `node dist/app.js` with no flags, which defaults to stdio mode. Pass `--sse`
+    (`npm start -- --sse`) or set `HARBOR_SSE=true` in `.env` to actually enable the HTTP server. Check the
+    startup log for `[MCP Server] Using SSE transport` / `SSE server running on ...` to confirm it turned on
+    before pointing a client at it.
+
+6. **MCP client logs `SSE connection established` (or similar) and then immediately gets a `404 Not Found`**
+
+    Your MCP client tried the deprecated `/sse` transport first, got connected, then attempted to POST a
+    follow-up request back to the same URL — which only exists as a `/mcp` endpoint here. This means the
+    client actually speaks the newer Streamable HTTP protocol. Point it at `/mcp` instead of `/sse` (see
+    [Connecting to the SSE Endpoint](#connecting-to-the-sse-endpoint)).
 
 ### Debug Mode
 
