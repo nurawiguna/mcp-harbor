@@ -143,6 +143,39 @@ describe("HarborService", () => {
           })
       ).toThrow(ValidationError);
     });
+
+    it("should append /api/v2.0 when apiUrl doesn't include it", () => {
+      new HarborService("http://harbor.example.com", testConfig.auth);
+      const lastCall = (HarborClient as jest.MockedClass<typeof HarborClient>)
+        .mock.calls.at(-1)?.[0] as { connectionOptions: { host: string } };
+      expect(lastCall.connectionOptions.host).toBe(
+        "http://harbor.example.com/api/v2.0"
+      );
+    });
+
+    it("should not duplicate /api/v2.0 when apiUrl already includes it", () => {
+      new HarborService(
+        "http://harbor.example.com/api/v2.0",
+        testConfig.auth
+      );
+      const lastCall = (HarborClient as jest.MockedClass<typeof HarborClient>)
+        .mock.calls.at(-1)?.[0] as { connectionOptions: { host: string } };
+      expect(lastCall.connectionOptions.host).toBe(
+        "http://harbor.example.com/api/v2.0"
+      );
+    });
+
+    it("should strip trailing slashes before checking/appending the API path", () => {
+      new HarborService(
+        "http://harbor.example.com/api/v2.0/",
+        testConfig.auth
+      );
+      const lastCall = (HarborClient as jest.MockedClass<typeof HarborClient>)
+        .mock.calls.at(-1)?.[0] as { connectionOptions: { host: string } };
+      expect(lastCall.connectionOptions.host).toBe(
+        "http://harbor.example.com/api/v2.0"
+      );
+    });
   });
 
   describe("getProjects", () => {

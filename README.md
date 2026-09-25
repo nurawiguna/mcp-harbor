@@ -154,7 +154,11 @@ Instead of command line arguments, you can also use environment variables. Creat
 # Harbor API Configuration
 # HARBOR_URL is the remote Harbor server this app connects OUT to.
 # Works with either http:// or https:// (matches the Harbor server's own setup).
-HARBOR_URL=https://harbor.example.com
+# Must point at the Harbor REST API base path, i.e. it needs a /api/v2.0
+# suffix - just the bare host (e.g. https://harbor.example.com) usually hits
+# Harbor's web UI instead of its JSON API and every tool call fails/returns
+# empty results. If you forget it, mcp-harbor appends /api/v2.0 for you.
+HARBOR_URL=https://harbor.example.com/api/v2.0
 HARBOR_USERNAME=admin
 HARBOR_PASSWORD=Harbor12345
 
@@ -397,7 +401,15 @@ mcp-harbor
     - Verify HARBOR_USERNAME and HARBOR_PASSWORD are correct
     - Check if user has required permissions
 
-3. **Build Errors**
+3. **Tool calls fail with `X.map is not a function`, or return an empty `{}` for a project/repo that exists**
+
+    This means requests are reaching Harbor's **web UI** instead of its **REST API** — almost always because
+    `HARBOR_URL` is missing the `/api/v2.0` path (e.g. `https://harbor.example.com` instead of
+    `https://harbor.example.com/api/v2.0`). mcp-harbor auto-appends `/api/v2.0` if it's missing, but double
+    check `HARBOR_URL` doesn't already point somewhere else unexpected (e.g. a path-based reverse proxy) if
+    this still happens after upgrading.
+
+4. **Build Errors**
 
     ```
     Error: TypeScript compilation failed
@@ -407,7 +419,7 @@ mcp-harbor
     - Check TypeScript version compatibility
     - Clear the `dist` directory and rebuild
 
-4. **`[MCP Error] SyntaxError: Unexpected end of JSON input` right after `npm start` / `npm run dev`**
+5. **`[MCP Error] SyntaxError: Unexpected end of JSON input` right after `npm start` / `npm run dev`**
 
     This is **not a crash** — the process keeps running. It happens because the default transport (stdio)
     expects every line on stdin to be a complete JSON-RPC message. If you run `npm start`/`npm run dev`
@@ -421,14 +433,14 @@ mcp-harbor
     - Pipe in a real JSON-RPC message: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | npm start`
     - Or use `--sse` mode and test with `curl`/a browser against the [SSE endpoint](#connecting-to-the-sse-endpoint), which is easier to interact with manually.
 
-5. **`npm start` alone doesn't open any port at all**
+6. **`npm start` alone doesn't open any port at all**
 
     `npm start` just runs `node dist/app.js` with no flags, which defaults to stdio mode. Pass `--sse`
     (`npm start -- --sse`) or set `HARBOR_SSE=true` in `.env` to actually enable the HTTP server. Check the
     startup log for `[MCP Server] Using SSE transport` / `SSE server running on ...` to confirm it turned on
     before pointing a client at it.
 
-6. **MCP client logs `SSE connection established` (or similar) and then immediately gets a `404 Not Found`**
+7. **MCP client logs `SSE connection established` (or similar) and then immediately gets a `404 Not Found`**
 
     Your MCP client tried the deprecated `/sse` transport first, got connected, then attempted to POST a
     follow-up request back to the same URL — which only exists as a `/mcp` endpoint here. This means the

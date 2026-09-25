@@ -57,11 +57,21 @@ export class HarborService {
         credentials: "include",
       },
       connectionOptions: {
-        host: apiUrl,
+        host: HarborService.normalizeApiUrl(apiUrl),
         user: auth.username,
         password: auth.password,
       },
     });
+  }
+
+  // @hapic/harbor expects the Harbor REST API base path (".../api/v2.0"), not
+  // just the Harbor host - hitting the host without it returns Harbor's web
+  // UI instead of JSON, which surfaces as confusing "X.map is not a
+  // function" / empty-object errors from every tool. Auto-append the API
+  // path when a caller passes just the host, since that's an easy mistake.
+  private static normalizeApiUrl(apiUrl: string): string {
+    const trimmed = apiUrl.replace(/\/+$/, "");
+    return /\/api\/v2\.0$/i.test(trimmed) ? trimmed : `${trimmed}/api/v2.0`;
   }
 
   // Project operations
