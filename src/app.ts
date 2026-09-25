@@ -159,8 +159,6 @@ const createServer: () => Promise<Server> = async (): Promise<Server> => {
   return server;
 };
 
-const server = await createServer();
-
 // Check if SSE transport is enabled
 if (argv.sse) {
   console.info("[MCP Server] Using SSE transport");
@@ -193,13 +191,25 @@ if (argv.sse) {
   app.get("/sse", requireAuth, async (req, res) => {
     console.log("[MCP Server] SSE connection established");
 
-    const transport = new SSEServerTransport("/messages", res);
-    transports.set(transport.sessionId, transport);
-    transport.onclose = (): void => {
-      transports.delete(transport.sessionId);
-    };
+    try {
+      // Each MCP Server/Protocol instance can only ever be bound to a single
+      // transport at a time, so every connection needs its own instance -
+      // sharing one across concurrent SSE clients throws "Already connected
+      // to a transport" on the second connection.
+      const server = await createServer();
+      const transport = new SSEServerTransport("/messages", res);
+      transports.set(transport.sessionId, transport);
+      transport.onclose = (): void => {
+        transports.delete(transport.sessionId);
+      };
 
-    await server.connect(transport);
+      await server.connect(transport);
+    } catch (error) {
+      console.error("[MCP Server] Failed to establish SSE connection", error);
+      if (!res.headersSent) {
+        res.status(500).end();
+      }
+    }
   });
 
   app.post("/messages", requireAuth, (req, res) => {
@@ -219,5 +229,6 @@ if (argv.sse) {
     );
   });
 } else {
+  const server = await createServer();
   await server.connect(new StdioServerTransport());
 }

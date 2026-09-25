@@ -1,7 +1,7 @@
 # MCP Harbor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-4.9.5-blue.svg)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6.3-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-18.x-green.svg)](https://nodejs.org/)
 
 > **This is a fork** of [nomagicln/mcp-harbor](https://github.com/nomagicln/mcp-harbor), the original MCP server for Harbor.
@@ -24,6 +24,7 @@ MCP Harbor is a Node.js application that provides a Model Context Protocol (MCP)
     - [Command Line Arguments](#command-line-arguments)
     - [Environment Variables](#environment-variables)
     - [Securing the SSE Transport](#securing-the-sse-transport)
+    - [Connecting to the SSE Endpoint](#connecting-to-the-sse-endpoint)
     - [Running in Production](#running-in-production)
     - [Using It From an MCP Client (e.g. Claude Desktop)](#using-it-from-an-mcp-client-eg-claude-desktop)
   - [MCP Tools](#mcp-tools)
@@ -103,8 +104,10 @@ MCP Harbor supports two transport modes:
 - **stdio** (default): the MCP client (e.g. Claude Desktop, Cursor) spawns `mcp-harbor` directly as a
   subprocess and communicates over stdin/stdout. No network port is opened at all, so no SSE-related
   configuration is needed. Use this when the client and `mcp-harbor` run on the same machine.
-- **SSE** (`--sse`): runs an HTTP server so MCP clients on a different machine/process can connect over the
-  network. Because this opens a network port, see [Securing the SSE Transport](#securing-the-sse-transport)
+- **SSE** (`--sse`, or `HARBOR_SSE=true` in `.env`): runs an HTTP server so MCP clients on a different
+  machine/process can connect over the network. This must be explicitly turned on — plain `npm start` /
+  `node dist/app.js` with no flags always runs stdio mode, even if `HARBOR_SSE_HOST`/`HARBOR_SSE_AUTH_TOKEN`
+  are set. Because enabling it opens a network port, see [Securing the SSE Transport](#securing-the-sse-transport)
   below before enabling it.
 
 ### Command Line Arguments
@@ -153,12 +156,19 @@ HARBOR_INSECURE_TLS=false
 # Debug Mode (true/false)
 DEBUG=false
 
-# --- Local SSE server (only used when --sse is enabled) ---
+# --- Local SSE server ---
 # These configure mcp-harbor's OWN inbound server, i.e. where MCP clients
 # (Claude, Cursor, etc.) connect TO this app. Unrelated to HARBOR_URL above.
 
-# Host/interface this app listens on. Keep 127.0.0.1 unless this server sits
-# behind a trusted reverse proxy/firewall that restricts who can reach it.
+# Enables SSE mode (equivalent to the --sse flag). Without this set to true
+# (in either this file or the actual environment) and without --sse passed on
+# the command line, mcp-harbor runs in stdio mode instead and never opens a
+# port at all - "npm start" alone does NOT turn SSE on by itself.
+HARBOR_SSE=true
+
+# Host/interface this app listens on (only relevant when SSE is enabled above).
+# Keep 127.0.0.1 unless this server sits behind a trusted reverse proxy/firewall
+# that restricts who can reach it.
 HARBOR_SSE_HOST=127.0.0.1
 # Bearer token required on the Authorization header for /sse and /messages.
 # Required in practice whenever HARBOR_SSE_HOST is anything other than 127.0.0.1.
@@ -176,6 +186,46 @@ reachable by more than just your own machine:
    reach it.
 3. Prefer a trusted reverse proxy with TLS termination in front of the SSE port if it is exposed beyond
    `localhost`, since the SSE server itself speaks plain HTTP.
+
+### Connecting to the SSE Endpoint
+
+When `--sse` is enabled, the URL an MCP client connects to is:
+
+```
+http://<host>:<port>/sse
+```
+
+- `<host>` / `<port>` are whatever `HARBOR_SSE_HOST` / `--port` are set to (default `127.0.0.1:3000`).
+- `/messages` is a **separate, internal** endpoint the server tells the client about after the `/sse`
+  connection is established (it includes a `sessionId` query parameter). MCP client libraries handle this
+  handshake automatically — you only ever configure the `/sse` URL, never `/messages` directly.
+
+Examples for `HARBOR_SSE_HOST=0.0.0.0`, default port:
+
+| Where the client runs | URL to use |
+|---|---|
+| Same machine as `mcp-harbor` | `http://127.0.0.1:3000/sse` |
+| A different machine on the network | `http://<mcp-harbor-host-ip>:3000/sse` |
+
+If `HARBOR_SSE_AUTH_TOKEN` is set, the client must send it as a bearer token on every request to `/sse`
+(and `/messages`). For an MCP client config that supports a remote/URL-based server entry, this typically
+looks like:
+
+```json
+{
+  "mcpServers": {
+    "harbor": {
+      "url": "http://<mcp-harbor-host-ip>:3000/sse",
+      "headers": {
+        "Authorization": "Bearer <your HARBOR_SSE_AUTH_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+The exact field names (`url`, `headers`, etc.) vary by MCP client — check that client's docs for how it
+configures a remote/SSE MCP server.
 
 ### Running in Production
 
@@ -195,6 +245,19 @@ npm start
 npm install -g .
 mcp-harbor --url https://harbor.example.com --username admin --password ***
 ```
+
+> **`npm start` on its own does NOT enable SSE mode.** It runs in stdio mode by default (no port opened at
+> all), regardless of `HARBOR_SSE_HOST`/`HARBOR_SSE_AUTH_TOKEN` being set — those only configure SSE, they
+> don't turn it on. If you hit `/sse` and get a connection error or 404, this is almost always why. To
+> actually enable SSE, either:
+>
+> ```bash
+> npm start -- --sse
+> ```
+>
+> or set `HARBOR_SSE=true` in your `.env` (see [.env.example](.env.example)) and then plain `npm start` is
+> enough. Either way, check the startup log for `[MCP Server] Using SSE transport` / `SSE server running on
+> ...` to confirm it actually turned on before pointing a client at it.
 
 For **SSE mode** in production, the process needs to keep running in the background (it doesn't daemonize
 itself). Use a process manager such as [pm2](https://pm2.keymetrics.io/) or a systemd unit, for example:
@@ -326,6 +389,20 @@ mcp-harbor
     - Run `npm install` to ensure all dependencies are installed
     - Check TypeScript version compatibility
     - Clear the `dist` directory and rebuild
+
+4. **`[MCP Error] SyntaxError: Unexpected end of JSON input` right after `npm start` / `npm run dev`**
+
+    This is **not a crash** — the process keeps running. It happens because the default transport (stdio)
+    expects every line on stdin to be a complete JSON-RPC message. If you run `npm start`/`npm run dev`
+    directly in a terminal and press Enter (sending an empty line) or type plain text, it can't be parsed
+    as JSON and this gets logged.
+
+    stdio mode isn't meant to be typed into manually — it's meant to be spawned by an MCP client (see
+    [Using It From an MCP Client](#using-it-from-an-mcp-client-eg-claude-desktop)). To sanity-check it from
+    a terminal instead, either:
+
+    - Pipe in a real JSON-RPC message: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | npm start`
+    - Or use `--sse` mode and test with `curl`/a browser against the [SSE endpoint](#connecting-to-the-sse-endpoint), which is easier to interact with manually.
 
 ### Debug Mode
 
